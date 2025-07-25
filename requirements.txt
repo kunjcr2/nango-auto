@@ -1,7 +1,7 @@
 # Core dependencies
 aiohttp
-asyncio-compat
 python-dotenv
+asyncio
 
 # LangChain and OpenAI
 langchain
@@ -9,7 +9,7 @@ openai
 tiktoken
 
 # FastAPI and server dependencies
-fastapi
+flask
 uvicorn[standard]
 pydantic
 python-multipart

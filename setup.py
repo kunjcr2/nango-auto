@@ -447,7 +447,7 @@ def main():
     if success:
         print("\n🎉 Setup completed successfully!")
         sys.exit(0)
-    else:ß
+    else:
         print("\n❌ Setup failed!")
         sys.exit(1)
 

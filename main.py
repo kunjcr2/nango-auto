@@ -15,7 +15,7 @@ import logging
 from datetime import datetime
 
 # LangChain imports
-from langchain.llms import OpenAI
+from langchain_community.llms import OpenAI
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
 from langchain.schema import BaseOutputParser
@@ -114,7 +114,7 @@ class CodeGenerator:
         self.client_template = PromptTemplate(
             input_variables=["integration_name", "provider", "endpoints", "base_url"],
             template="""
-Generate a Python client class for {integration_name} integration with {provider}.
+Generate a PYTHON client class for {integration_name} integration with {provider}.
 
 Requirements:
 - Use async/await patterns
@@ -132,10 +132,10 @@ Generate a complete, production-ready client class.
         self.server_template = PromptTemplate(
             input_variables=["integration_name", "provider", "endpoints"],
             template="""
-Generate a FastAPI server with endpoints for {integration_name} integration with {provider}.
+Generate a FLASK server in PYTHON with endpoints for {integration_name} integration with {provider}.
 
 Requirements:
-- FastAPI framework
+- Flask framework
 - Async endpoints
 - Error handling middleware
 - Nango integration for OAuth
@@ -151,7 +151,7 @@ Generate complete server code with all routes.
         self.middleware_template = PromptTemplate(
             input_variables=["integration_name", "provider"],
             template="""
-Generate middleware code for {integration_name} with {provider} that handles:
+Generate middleware code in PYTHON for {integration_name} with {provider} that handles:
 
 Requirements:
 - Token refresh logic using Nango
@@ -168,7 +168,7 @@ Generate production-ready middleware.
         self.usage_template = PromptTemplate(
             input_variables=["integration_name", "provider", "endpoints"],
             template="""
-Generate comprehensive usage examples for {integration_name} integration with {provider}.
+Generate comprehensive usage examples in PYTHON for {integration_name} integration with {provider}.
 
 Include:
 - Basic setup and initialization
@@ -572,9 +572,9 @@ async def main():
     """Main entry point"""
     # Load environment variables
     nango_secret_key = os.getenv("NANGO_SECRET_KEY")
-    nango_public_key = os.getenv("NANGO_PUBLIC_KEY") 
+    nango_public_key = os.getenv("NANGO_PUBLIC_KEY")
     openai_api_key = os.getenv("OPENAI_API_KEY")
-    
+
     if not all([nango_secret_key, nango_public_key, openai_api_key]):
         print("❌ Missing required environment variables:")
         print("   - NANGO_SECRET_KEY")

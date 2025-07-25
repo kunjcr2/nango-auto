@@ -1,0 +1,27 @@
+{
+  "version": "1.0.0",
+  "project_name": "Integration Automation Agent",
+  "default_settings": {
+    "cache_ttl": 300,
+    "rate_limit_per_minute": 60,
+    "max_retries": 3,
+    "timeout_seconds": 30
+  },
+  "supported_providers": [
+    "slack",
+    "github",
+    "google_drive",
+    "notion",
+    "hubspot",
+    "salesforce",
+    "discord",
+    "shopify",
+    "trello",
+    "airtable"
+  ],
+  "logging": {
+    "level": "INFO",
+    "format": "json",
+    "file": "logs/integration_agent.log"
+  }
+}
