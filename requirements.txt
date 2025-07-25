@@ -1,0 +1,39 @@
+# Core dependencies
+aiohttp
+asyncio-compat
+python-dotenv
+
+# LangChain and OpenAI
+langchain
+openai
+tiktoken
+
+# FastAPI and server dependencies
+fastapi
+uvicorn[standard]
+pydantic
+python-multipart
+
+# HTTP and API clients
+httpx
+requests
+
+# Data handling
+pydantic-settings
+python-jose[cryptography]
+passlib[bcrypt]
+
+# Logging and monitoring
+structlog
+rich
+
+# Development and testing
+pytest
+pytest-asyncio
+black
+flake8
+mypy
+
+# Additional utilities
+click
+jinja2
