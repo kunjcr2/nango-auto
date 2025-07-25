@@ -9,7 +9,7 @@ openai
 tiktoken
 
 # FastAPI and server dependencies
-flask
+FastAPI
 uvicorn[standard]
 pydantic
 python-multipart

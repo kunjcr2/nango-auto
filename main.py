@@ -1,590 +1,316 @@
-#!/usr/bin/env python3
-"""
-Integration Automation Agent
-Automates the creation of API integrations using Nango for OAuth management
-"""
-
-import os
 import json
-import asyncio
-import aiohttp
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, asdict
+import os
 from pathlib import Path
-import logging
-from datetime import datetime
+from typing import Dict, List, Any
+from langchain.agents import AgentExecutor, Tool, initialize_agent
+from langchain_openai import ChatOpenAI
+from langchain.schema import SystemMessage, HumanMessage
+from langchain.prompts import MessagesPlaceholder
+from langchain.agents import AgentType
 
-# LangChain imports
-from langchain_community.llms import OpenAI
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
-from langchain.schema import BaseOutputParser
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-@dataclass
-class IntegrationConfig:
-    """Configuration for an API integration"""
-    name: str
-    provider: str
-    client_id: str
-    client_secret: str
-    scopes: List[str]
-    base_url: str
-    auth_url: str
-    token_url: str
-    endpoints: List[Dict[str, Any]]
-    webhook_url: Optional[str] = None
-
-@dataclass
-class GeneratedIntegration:
-    """Result of generated integration"""
-    config: IntegrationConfig
-    client_code: str
-    server_code: str
-    middleware_code: str
-    usage_examples: str
-
-class NangoClient:
-    """Client for interacting with Nango API"""
+class APIGeneratorAgent:
+    """
+    Agent-based API Generator with memory and interactive capabilities
+    """
     
-    def __init__(self, nango_secret_key: str, nango_public_key: str, base_url: str = "https://api.nango.dev"):
-        self.secret_key = nango_secret_key
-        self.public_key = nango_public_key
-        self.base_url = base_url
-        self.headers = {
-            "Authorization": f"Bearer {self.secret_key}",
-            "Content-Type": "application/json"
-        }
-    
-    async def create_integration(self, integration_config: IntegrationConfig) -> Dict[str, Any]:
-        """Create an integration in Nango"""
-        payload = {
-            "unique_key": integration_config.name.lower().replace(" ", "_"),
-            "provider": integration_config.provider.lower(),
-            "client_id": integration_config.client_id,
-            "client_secret": integration_config.client_secret,
-            "scopes": integration_config.scopes,
-            "auth_mode": "OAUTH2",
-            "oauth_client_id": integration_config.client_id,
-            "oauth_client_secret": integration_config.client_secret,
-            "oauth_scopes": integration_config.scopes
-        }
+    def __init__(self, openai_api_key: str = None):
+        """
+        Initialize the API Generator Agent
         
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.base_url}/config",
-                headers=self.headers,
-                json=payload
-            ) as response:
-                if response.status == 201:
-                    result = await response.json()
-                    logger.info(f"Successfully created integration: {integration_config.name}")
-                    return result
-                else:
-                    error_text = await response.text()
-                    raise Exception(f"Failed to create integration: {error_text}")
-    
-    async def get_connection(self, connection_id: str, provider_config_key: str) -> Dict[str, Any]:
-        """Get connection details from Nango"""
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{self.base_url}/connection/{connection_id}",
-                headers={**self.headers, "Provider-Config-Key": provider_config_key}
-            ) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    error_text = await response.text()
-                    raise Exception(f"Failed to get connection: {error_text}")
-
-class CodeGenerator:
-    """Generates integration code using LangChain"""
-    
-    def __init__(self, openai_api_key: str):
-        self.llm = OpenAI(
-            api_key=openai_api_key,
+        Args:
+            openai_api_key: OpenAI API key (can also be set via OPENAI_API_KEY env var)
+        """
+        self.api_key = openai_api_key or os.getenv('OPENAI_API_KEY')
+        if not self.api_key:
+            raise ValueError("OpenAI API key is required. Set OPENAI_API_KEY environment variable or pass it directly.")
+        
+        # Initialize LLM
+        self.llm = ChatOpenAI(
+            model_name="gpt-4",
             temperature=0.1,
-            max_tokens=2000
+            max_tokens=2500,
+            openai_api_key=self.api_key
         )
         
-        # Prompt templates for different code generation tasks
-        self.client_template = PromptTemplate(
-            input_variables=["integration_name", "provider", "endpoints", "base_url"],
-            template="""
-Generate a PYTHON client class for {integration_name} integration with {provider}.
-
-Requirements:
-- Use async/await patterns
-- Include proper error handling
-- Base URL: {base_url}
-- Available endpoints: {endpoints}
-- Use Nango for token management
-- Include rate limiting
-- Add comprehensive docstrings
-
-Generate a complete, production-ready client class.
-"""
-        )
-        
-        self.server_template = PromptTemplate(
-            input_variables=["integration_name", "provider", "endpoints"],
-            template="""
-Generate a FLASK server in PYTHON with endpoints for {integration_name} integration with {provider}.
-
-Requirements:
-- Flask framework
-- Async endpoints
-- Error handling middleware
-- Nango integration for OAuth
-- Available endpoints to proxy: {endpoints}
-- Include health check endpoint
-- Add request/response models with Pydantic
-- Include CORS middleware
-
-Generate complete server code with all routes.
-"""
-        )
-        
-        self.middleware_template = PromptTemplate(
-            input_variables=["integration_name", "provider"],
-            template="""
-Generate middleware code in PYTHON for {integration_name} with {provider} that handles:
-
-Requirements:
-- Token refresh logic using Nango
-- Rate limiting
-- Request/response logging
-- Error handling and retries
-- Connection pooling
-- Health checks
-
-Generate production-ready middleware.
-"""
-        )
-        
-        self.usage_template = PromptTemplate(
-            input_variables=["integration_name", "provider", "endpoints"],
-            template="""
-Generate comprehensive usage examples in PYTHON for {integration_name} integration with {provider}.
-
-Include:
-- Basic setup and initialization
-- Authentication flow
-- Examples for each endpoint: {endpoints}
-- Error handling examples
-- Best practices
-- Common use cases
-
-Provide clear, commented examples.
-"""
-        )
-    
-    async def generate_client_code(self, config: IntegrationConfig) -> str:
-        """Generate client code for the integration"""
-        chain = LLMChain(llm=self.llm, prompt=self.client_template)
-        result = await chain.arun(
-            integration_name=config.name,
-            provider=config.provider,
-            endpoints=json.dumps(config.endpoints, indent=2),
-            base_url=config.base_url
-        )
-        return result
-    
-    async def generate_server_code(self, config: IntegrationConfig) -> str:
-        """Generate server code for the integration"""
-        chain = LLMChain(llm=self.llm, prompt=self.server_template)
-        result = await chain.arun(
-            integration_name=config.name,
-            provider=config.provider,
-            endpoints=json.dumps(config.endpoints, indent=2)
-        )
-        return result
-    
-    async def generate_middleware_code(self, config: IntegrationConfig) -> str:
-        """Generate middleware code for the integration"""
-        chain = LLMChain(llm=self.llm, prompt=self.middleware_template)
-        result = await chain.arun(
-            integration_name=config.name,
-            provider=config.provider
-        )
-        return result
-    
-    async def generate_usage_examples(self, config: IntegrationConfig) -> str:
-        """Generate usage examples for the integration"""
-        chain = LLMChain(llm=self.llm, prompt=self.usage_template)
-        result = await chain.arun(
-            integration_name=config.name,
-            provider=config.provider,
-            endpoints=json.dumps(config.endpoints, indent=2)
-        )
-        return result
-
-class IntegrationAgent:
-    """Main agent class that orchestrates the integration automation"""
-    
-    # Predefined configurations for 10 popular APIs
-    SUPPORTED_INTEGRATIONS = {
-        "slack": {
-            "provider": "slack",
-            "base_url": "https://slack.com/api",
-            "auth_url": "https://slack.com/oauth/v2/authorize",
-            "token_url": "https://slack.com/api/oauth.v2.access",
-            "scopes": ["chat:write", "channels:read", "users:read"],
-            "endpoints": [
-                {"name": "send_message", "method": "POST", "path": "/chat.postMessage"},
-                {"name": "list_channels", "method": "GET", "path": "/conversations.list"},
-                {"name": "get_user_info", "method": "GET", "path": "/users.info"}
-            ]
-        },
-        "github": {
-            "provider": "github",
-            "base_url": "https://api.github.com",
-            "auth_url": "https://github.com/login/oauth/authorize",
-            "token_url": "https://github.com/login/oauth/access_token",
-            "scopes": ["repo", "user"],
-            "endpoints": [
-                {"name": "list_repos", "method": "GET", "path": "/user/repos"},
-                {"name": "create_issue", "method": "POST", "path": "/repos/{owner}/{repo}/issues"},
-                {"name": "get_user", "method": "GET", "path": "/user"}
-            ]
-        },
-        "google_drive": {
-            "provider": "google-drive",
-            "base_url": "https://www.googleapis.com/drive/v3",
-            "auth_url": "https://accounts.google.com/o/oauth2/auth",
-            "token_url": "https://oauth2.googleapis.com/token",
-            "scopes": ["https://www.googleapis.com/auth/drive"],
-            "endpoints": [
-                {"name": "list_files", "method": "GET", "path": "/files"},
-                {"name": "upload_file", "method": "POST", "path": "/files"},
-                {"name": "download_file", "method": "GET", "path": "/files/{fileId}"}
-            ]
-        },
-        "notion": {
-            "provider": "notion",
-            "base_url": "https://api.notion.com/v1",
-            "auth_url": "https://api.notion.com/v1/oauth/authorize",
-            "token_url": "https://api.notion.com/v1/oauth/token",
-            "scopes": ["read", "update"],
-            "endpoints": [
-                {"name": "list_databases", "method": "GET", "path": "/databases"},
-                {"name": "query_database", "method": "POST", "path": "/databases/{database_id}/query"},
-                {"name": "create_page", "method": "POST", "path": "/pages"}
-            ]
-        },
-        "hubspot": {
-            "provider": "hubspot",
-            "base_url": "https://api.hubapi.com",
-            "auth_url": "https://app.hubspot.com/oauth/authorize",
-            "token_url": "https://api.hubapi.com/oauth/v1/token",
-            "scopes": ["contacts", "content"],
-            "endpoints": [
-                {"name": "get_contacts", "method": "GET", "path": "/crm/v3/objects/contacts"},
-                {"name": "create_contact", "method": "POST", "path": "/crm/v3/objects/contacts"},
-                {"name": "get_deals", "method": "GET", "path": "/crm/v3/objects/deals"}
-            ]
-        },
-        "salesforce": {
-            "provider": "salesforce",
-            "base_url": "https://your-domain.salesforce.com",
-            "auth_url": "https://login.salesforce.com/services/oauth2/authorize",
-            "token_url": "https://login.salesforce.com/services/oauth2/token",
-            "scopes": ["api", "refresh_token"],
-            "endpoints": [
-                {"name": "get_accounts", "method": "GET", "path": "/services/data/v52.0/sobjects/Account"},
-                {"name": "create_lead", "method": "POST", "path": "/services/data/v52.0/sobjects/Lead"},
-                {"name": "get_opportunities", "method": "GET", "path": "/services/data/v52.0/sobjects/Opportunity"}
-            ]
-        },
-        "discord": {
-            "provider": "discord",
-            "base_url": "https://discord.com/api/v10",
-            "auth_url": "https://discord.com/api/oauth2/authorize",
-            "token_url": "https://discord.com/api/oauth2/token",
-            "scopes": ["bot", "messages.read"],
-            "endpoints": [
-                {"name": "send_message", "method": "POST", "path": "/channels/{channel_id}/messages"},
-                {"name": "get_guild", "method": "GET", "path": "/guilds/{guild_id}"},
-                {"name": "get_user", "method": "GET", "path": "/users/@me"}
-            ]
-        },
-        "shopify": {
-            "provider": "shopify",
-            "base_url": "https://{shop}.myshopify.com/admin/api/2023-04",
-            "auth_url": "https://{shop}.myshopify.com/admin/oauth/authorize",
-            "token_url": "https://{shop}.myshopify.com/admin/oauth/access_token",
-            "scopes": ["read_products", "write_products"],
-            "endpoints": [
-                {"name": "get_products", "method": "GET", "path": "/products.json"},
-                {"name": "create_product", "method": "POST", "path": "/products.json"},
-                {"name": "get_orders", "method": "GET", "path": "/orders.json"}
-            ]
-        },
-        "trello": {
-            "provider": "trello",
-            "base_url": "https://api.trello.com/1",
-            "auth_url": "https://trello.com/1/authorize",
-            "token_url": "https://trello.com/1/OAuthGetAccessToken",
-            "scopes": ["read", "write"],
-            "endpoints": [
-                {"name": "get_boards", "method": "GET", "path": "/members/me/boards"},
-                {"name": "create_card", "method": "POST", "path": "/cards"},
-                {"name": "get_lists", "method": "GET", "path": "/boards/{board_id}/lists"}
-            ]
-        },
-        "airtable": {
-            "provider": "airtable",
-            "base_url": "https://api.airtable.com/v0",
-            "auth_url": "https://airtable.com/oauth2/v1/authorize",
-            "token_url": "https://airtable.com/oauth2/v1/token",
-            "scopes": ["data.records:read", "data.records:write"],
-            "endpoints": [
-                {"name": "list_records", "method": "GET", "path": "/{base_id}/{table_name}"},
-                {"name": "create_record", "method": "POST", "path": "/{base_id}/{table_name}"},
-                {"name": "update_record", "method": "PATCH", "path": "/{base_id}/{table_name}/{record_id}"}
-            ]
-        }
-    }
-    
-    def __init__(self, nango_secret_key: str, nango_public_key: str, openai_api_key: str):
-        self.nango_client = NangoClient(nango_secret_key, nango_public_key)
-        self.code_generator = CodeGenerator(openai_api_key)
-        self.output_dir = Path("generated_integrations")
-        self.output_dir.mkdir(exist_ok=True)
-    
-    def display_available_integrations(self) -> None:
-        """Display available integrations to the user"""
-        print("\n🚀 Available Integrations:")
-        print("=" * 50)
-        for i, (key, config) in enumerate(self.SUPPORTED_INTEGRATIONS.items(), 1):
-            print(f"{i:2d}. {key.title().replace('_', ' ')}")
-            print(f"    Provider: {config['provider']}")
-            print(f"    Endpoints: {len(config['endpoints'])} available")
-            print()
-    
-    def get_user_selection(self) -> List[str]:
-        """Get user's selection of integrations"""
-        self.display_available_integrations()
-        
-        while True:
-            try:
-                selection = input("\nEnter integration numbers (comma-separated, e.g., 1,3,5): ").strip()
-                indices = [int(x.strip()) for x in selection.split(',')]
-                
-                if not all(1 <= i <= len(self.SUPPORTED_INTEGRATIONS) for i in indices):
-                    print("❌ Invalid selection. Please enter valid numbers.")
-                    continue
-                
-                selected_keys = [list(self.SUPPORTED_INTEGRATIONS.keys())[i-1] for i in indices]
-                return selected_keys
-                
-            except ValueError:
-                print("❌ Invalid input. Please enter numbers separated by commas.")
-    
-    def get_credentials(self, integration_name: str) -> tuple[str, str]:
-        """Get credentials for a specific integration"""
-        print(f"\n🔐 Enter credentials for {integration_name.title().replace('_', ' ')}:")
-        client_id = input("Client ID: ").strip()
-        client_secret = input("Client Secret: ").strip()
-        
-        if not client_id or not client_secret:
-            raise ValueError("Both Client ID and Client Secret are required")
-        
-        return client_id, client_secret
-    
-    async def create_integration(self, integration_key: str, client_id: str, client_secret: str) -> GeneratedIntegration:
-        """Create a complete integration"""
-        template = self.SUPPORTED_INTEGRATIONS[integration_key]
-        
-        # Create integration configuration
-        config = IntegrationConfig(
-            name=integration_key.replace('_', ' ').title(),
-            provider=template["provider"],
-            client_id=client_id,
-            client_secret=client_secret,
-            scopes=template["scopes"],
-            base_url=template["base_url"],
-            auth_url=template["auth_url"],
-            token_url=template["token_url"],
-            endpoints=template["endpoints"]
-        )
-        
-        print(f"📝 Generating code for {config.name}...")
-        
-        # Generate all code components concurrently
-        tasks = [
-            self.code_generator.generate_client_code(config),
-            self.code_generator.generate_server_code(config),
-            self.code_generator.generate_middleware_code(config),
-            self.code_generator.generate_usage_examples(config)
+        # Set up tools
+        self.tools = [
+            Tool(
+                name="api_config_generator",
+                func=self._generate_api_config,
+                description="Generates real API configurations for given applications. Input should be a comma-separated list of application names."
+            ),
+            Tool(
+                name="save_configurations",
+                func=self._save_configurations,
+                description="Saves generated API configurations to files. Input should be a JSON string of configurations."
+            )
         ]
         
-        client_code, server_code, middleware_code, usage_examples = await asyncio.gather(*tasks)
-        
-        # Create integration in Nango
-        print(f"🔗 Creating integration in Nango...")
-        try:
-            await self.nango_client.create_integration(config)
-        except Exception as e:
-            logger.warning(f"Failed to create Nango integration: {e}")
-            print(f"⚠️ Warning: Could not create integration in Nango: {e}")
-        
-        return GeneratedIntegration(
-            config=config,
-            client_code=client_code,
-            server_code=server_code,
-            middleware_code=middleware_code,
-            usage_examples=usage_examples
+        # Initialize agent
+        self.agent = initialize_agent(
+            tools=self.tools,
+            llm=self.llm,
+            agent=AgentType.OPENAI_FUNCTIONS,
+            verbose=True,
         )
     
-    def save_integration_files(self, integration: GeneratedIntegration) -> None:
-        """Save generated files to disk"""
-        integration_name = integration.config.name.lower().replace(' ', '_')
-        integration_dir = self.output_dir / integration_name
-        integration_dir.mkdir(exist_ok=True)
+    def _generate_api_config(self, applications_input: str) -> Dict[str, Dict[str, Any]]:
+        """
+        Generate API configurations for multiple applications
+        """
+        app_names = [app.strip().lower() for app in applications_input.split(',')]
+        app_names = [app for app in app_names if app]
         
-        # Save all generated files
-        files = {
-            "client.py": integration.client_code,
-            "server.py": integration.server_code,
-            "middleware.py": integration.middleware_code,
-            "examples.py": integration.usage_examples,
-            "config.json": json.dumps(asdict(integration.config), indent=2)
-        }
+        if not app_names:
+            return {}
         
-        for filename, content in files.items():
-            filepath = integration_dir / filename
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(content)
+        configs = {}
         
-        print(f"📁 Files saved to: {integration_dir}")
+        for app_name in app_names:
+            config = self._call_openai_api(app_name)
+            configs[app_name] = config
+        
+        return configs
     
-    async def run(self) -> None:
-        """Main execution method"""
-        print("🤖 Integration Automation Agent")
-        print("=" * 50)
-        print("Automate API integrations with Nango + Code Generation")
+    def _call_openai_api(self, application_name: str) -> Dict[str, Any]:
+        """
+        Call OpenAI to generate API configuration
+        """
+        prompt = f"""I need the ACTUAL, REAL API endpoints for {application_name}'s official API. Please provide the exact endpoints that exist in their current API documentation.
+
+Generate a JSON configuration with this structure:
+{{
+    "provider": "Exact Official Name",
+    "base_url": "Real base URL from official docs", 
+    "endpoints": [
+        {{"name": "real_endpoint_name", "method": "ACTUAL_METHOD", "path": "/real/api/path", "description": "What this real endpoint actually does"}},
+        ...
+    ]
+}}
+
+CRITICAL REQUIREMENTS:
+1. Use ONLY real, documented endpoints from {application_name}'s official API
+2. Use the exact base URL from their official documentation
+3. Use real endpoint paths that actually exist
+4. Include 5-10 of their most important/commonly used endpoints
+5. Use correct HTTP methods (GET, POST, PUT, DELETE, PATCH)
+6. For well-known APIs like Slack, GitHub, Discord, Twitter, etc. - use their EXACT documented endpoints
+
+Return ONLY the JSON, no explanations:"""
+
+        messages = [
+            SystemMessage(content="You are an expert API documentation specialist with deep knowledge of real API endpoints from major platforms."),
+            HumanMessage(content=prompt)
+        ]
         
+        response = self.llm(messages)
+        content = response.content.strip()
+        
+        if content.startswith('```json'):
+            content = content.replace('```json', '').replace('```', '').strip()
+        elif content.startswith('```'):
+            content = content.replace('```', '').strip()
+        
+        return json.loads(content)
+    
+    def _save_configurations(self, configs_json: str) -> str:
+        """
+        Save configurations to files
+        """
         try:
-            # Get user selections
-            selected_integrations = self.get_user_selection()
-            
-            print(f"\n✅ Selected {len(selected_integrations)} integrations:")
-            for integration in selected_integrations:
-                print(f"  • {integration.title().replace('_', ' ')}")
-            
-            # Process each integration
-            generated_integrations = []
-            
-            for integration_key in selected_integrations:
-                print(f"\n{'='*60}")
-                print(f"Processing: {integration_key.title().replace('_', ' ')}")
-                print(f"{'='*60}")
-                
-                try:
-                    client_id, client_secret = self.get_credentials(integration_key)
-                    integration = await self.create_integration(integration_key, client_id, client_secret)
-                    self.save_integration_files(integration)
-                    generated_integrations.append(integration)
-                    
-                    print(f"✅ {integration_key.title().replace('_', ' ')} integration completed!")
-                    
-                except Exception as e:
-                    print(f"❌ Failed to create integration for {integration_key}: {e}")
-                    logger.error(f"Integration creation failed: {e}")
-                    continue
-            
-            # Generate summary
-            self.generate_summary(generated_integrations)
-            
-        except KeyboardInterrupt:
-            print("\n\n👋 Integration process cancelled by user.")
+            configs = json.loads(configs_json)
+            self._generate_files(configs)
+            return "Successfully saved all API configurations to files."
         except Exception as e:
-            print(f"\n❌ An error occurred: {e}")
-            logger.error(f"Application error: {e}")
+            return f"Error saving configurations: {str(e)}"
     
-    def generate_summary(self, integrations: List[GeneratedIntegration]) -> None:
-        """Generate a summary of all created integrations"""
-        summary_path = self.output_dir / "integration_summary.md"
+    def _generate_files(self, configs: Dict[str, Dict[str, Any]]) -> None:
+        """
+        Generate Python files, requirements.txt, and README for each API
+        """
+        base_dir = Path("generated")
+        base_dir.mkdir(exist_ok=True)
         
-        summary_content = f"""# Integration Summary
-Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-## Created Integrations ({len(integrations)})
-
-"""
-        
-        for integration in integrations:
-            config = integration.config
-            summary_content += f"""### {config.name}
-- **Provider**: {config.provider}
-- **Base URL**: {config.base_url}
-- **Scopes**: {', '.join(config.scopes)}
-- **Endpoints**: {len(config.endpoints)} available
-- **Files Generated**: client.py, server.py, middleware.py, examples.py, config.json
-
-"""
-        
-        summary_content += """## Next Steps
-
-1. **Setup Environment Variables**:
-   ```bash
-   export NANGO_SECRET_KEY="your_nango_secret_key"
-   export NANGO_PUBLIC_KEY="your_nango_public_key"
-   ```
-
-2. **Install Dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Run Individual Servers**:
-   ```bash
-   cd generated_integrations/[integration_name]
-   python server.py
-   ```
-
-4. **Use the Client**:
-   ```python
-   from generated_integrations.[integration_name].client import [IntegrationName]Client
-   
-   client = [IntegrationName]Client()
-   # Follow examples in examples.py
-   ```
-
-## Support
-- Check individual integration directories for specific usage examples
-- Refer to Nango documentation for OAuth flow details
-- Each integration includes comprehensive error handling and rate limiting
-"""
-        
-        with open(summary_path, 'w', encoding='utf-8') as f:
-            f.write(summary_content)
-        
-        print(f"\n📋 Integration summary saved to: {summary_path}")
-        print(f"\n🎉 Successfully generated {len(integrations)} integrations!")
-        print("🚀 Check the generated_integrations/ directory for all files.")
-
-async def main():
-    """Main entry point"""
-    # Load environment variables
-    nango_secret_key = os.getenv("NANGO_SECRET_KEY")
-    nango_public_key = os.getenv("NANGO_PUBLIC_KEY")
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-
-    if not all([nango_secret_key, nango_public_key, openai_api_key]):
-        print("❌ Missing required environment variables:")
-        print("   - NANGO_SECRET_KEY")
-        print("   - NANGO_PUBLIC_KEY") 
-        print("   - OPENAI_API_KEY")
-        return
+        for app_name, config in configs.items():
+            app_dir = base_dir / app_name
+            app_dir.mkdir(exist_ok=True)
+            
+            # Generate Python client file
+            self._generate_python_client(app_dir, app_name, config)
+            
+            # Generate requirements.txt
+            self._generate_requirements(app_dir)
+            
+            # Generate README
+            self._generate_readme(app_dir, app_name, config)
     
-    # Initialize and run the agent
-    agent = IntegrationAgent(nango_secret_key, nango_public_key, openai_api_key)
-    await agent.run()
+    def _generate_python_client(self, app_dir: Path, app_name: str, config: Dict[str, Any]) -> None:
+        """
+        Generate Python client file for the API
+        """
+        endpoint_methods = []
+        
+        for endpoint in config['endpoints']:
+            method_name = endpoint['name'].replace('.', '_').replace('-', '_')
+            docstring = f"    \"\"\"\n    {endpoint['description']}\n    "
+            
+            if '{' in endpoint['path']:
+                # Handle path parameters
+                path_parts = endpoint['path'].split('/')
+                params = []
+                for part in path_parts:
+                    if part.startswith('{') and part.endswith('}'):
+                        param = part[1:-1]
+                        params.append(param)
+                
+                params_str = ', '.join(params)
+                method_def = f"def {method_name}(self, {params_str}):"
+                path_str = endpoint['path']
+                for param in params:
+                    path_str = path_str.replace(f'{{{param}}}', f'{{{param}}}')
+                
+                endpoint_code = f"""
+{method_def}
+{docstring}
+    \"\"\"
+    url = f\"{config['base_url']}{path_str}\"
+    response = requests.{endpoint['method'].lower()}(url, headers=self.headers)
+    return self._handle_response(response)
+"""
+            else:
+                # Simple endpoint without path parameters
+                method_def = f"def {method_name}(self):"
+                endpoint_code = f"""
+{method_def}
+{docstring}
+    \"\"\"
+    url = \"{config['base_url']}{endpoint['path']}\"
+    response = requests.{endpoint['method'].lower()}(url, headers=self.headers)
+    return self._handle_response(response)
+"""
+            
+            endpoint_methods.append(endpoint_code)
+        
+        methods_str = '\n'.join(endpoint_methods)
+        
+        client_code = f"""import requests
+import json
+
+class {app_name.title()}Client:
+    \"\"\"
+    Python client for {config['provider']} API
+    \"\"\"
+    
+    def __init__(self, api_key=None):
+        self.base_url = \"{config['base_url']}\"
+        self.headers = {{
+            \"Content-Type\": \"application/json\",
+            \"Accept\": \"application/json\"
+        }}
+        if api_key:
+            self.headers[\"Authorization\"] = f\"Bearer {{api_key}}\"
+    
+    def _handle_response(self, response):
+        try:
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as errh:
+            print(f\"Http Error: {{errh}}\")
+        except requests.exceptions.ConnectionError as errc:
+            print(f\"Error Connecting: {{errc}}\")
+        except requests.exceptions.Timeout as errt:
+            print(f\"Timeout Error: {{errt}}\")
+        except requests.exceptions.RequestException as err:
+            print(f\"Something went wrong: {{err}}\")
+        return None
+
+{methods_str}
+"""
+
+        with open(app_dir / f"{app_name}_client.py", "w") as f:
+            f.write(client_code)
+    
+    def _generate_requirements(self, app_dir: Path) -> None:
+        """
+        Generate requirements.txt file
+        """
+        requirements = """requests>=2.28.1
+python-dotenv>=0.21.0
+"""
+        with open(app_dir / "requirements.txt", "w") as f:
+            f.write(requirements)
+    
+    def _generate_readme(self, app_dir: Path, app_name: str, config: Dict[str, Any]) -> None:
+        """
+        Generate README.md file
+        """
+        endpoints_table = "| Endpoint | Method | Path | Description |\n"
+        endpoints_table += "|----------|--------|------|-------------|\n"
+        
+        for endpoint in config['endpoints']:
+            endpoints_table += f"| {endpoint['name']} | {endpoint['method']} | `{endpoint['path']}` | {endpoint['description']} |\n"
+        
+        readme_content = f"""# {config['provider']} API Client
+
+## Overview
+Python client for interacting with the {config['provider']} API.
+
+## Installation
+1. Clone this repository
+2. Install requirements:
+```bash
+pip install -r requirements.txt
+Usage
+python
+from {app_name}_client import {app_name.title()}Client
+
+# Initialize client with your API key
+client = {app_name.title()}Client(api_key="your_api_key_here")
+
+# Example API call
+response = client.example_endpoint()
+print(response)
+Available Endpoints
+{endpoints_table}
+
+Authentication
+Most endpoints require an API key. Pass it when initializing the client.
+"""
+
+        with open(app_dir / "README.md", "w") as f:
+            f.write(readme_content)
+
+    def run(self):
+        """
+        Run the agent in interactive mode
+        """
+        print("="*50)
+        print("🌟 API Generator Agent 🌟")
+        print("I can generate Python clients for real APIs. What would you like to do?")
+        print("Examples:")
+        print("- Generate API clients for youtube, slack, github")
+        print("- Save the configurations")
+        print("- Exit")
+        
+        while True:
+            user_input = input("\nYou: ").strip()
+
+            apps = user_input.split(", ")
+            
+            if user_input.lower() in ['exit', 'quit']:
+                print("Goodbye!")
+                break
+                
+            for app in apps:
+                try:
+                    response = self.agent.invoke(app)
+                    print(f"\nAgent: {response}")
+                except Exception as e:
+                    print(f"Error: {str(e)}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Initialize the agent
+    agent = APIGeneratorAgent()
+
+    # Run the agent interactively
+    agent.run()
